@@ -166,6 +166,9 @@
 // the rate limit. Fetches only happen while the stock page is actually shown.
 #define STOCK_REFRESH_MS  60000UL   // minimum ms between stock API calls (60 s)
 
+static constexpr uint8_t BRIGHTNESS_DEFAULT = 180;
+static constexpr uint8_t BRIGHTNESS_MINIMUM = 8;
+
 static constexpr uint32_t HTTP_TIMEOUT_MS              = 1500UL;
 static constexpr uint32_t NTP_RETRY_INTERVAL_MS        = 60000UL;
 static constexpr uint32_t WEATHER_REFRESH_INTERVAL_MS = 15UL * 60UL * 1000UL;
@@ -265,6 +268,9 @@ void updateFaceTimers();
 void updateAutoPage();
 void updateNetworkPages();
 void calibrateNeutral();
+void loadDisplaySettings();
+void saveDisplaySettings();
+void setBrightness(int level);
 
 // V2 additions
 void drawBootMessage(const char *l1, const char *l2, const char *l3);
@@ -594,6 +600,8 @@ uint32_t nextBlink       = 1400;
 uint32_t blinkUntil      = 0;
 uint32_t nextGlance      = 900;
 uint32_t nextAutoPage    = PAGE_AUTO_INTERVAL_MS;
+uint8_t  brightnessLevel = BRIGHTNESS_DEFAULT;
+uint32_t brightnessBannerUntil = 0;
 uint32_t lastSerialMs    = 0;
 uint32_t clockStartMillis   = 0;
 uint32_t clockStartSeconds  = 0;
@@ -1773,6 +1781,35 @@ void maintainWifi() {
   wifiManager.reintentarConexionSiNecesario();
 }
 
+void saveDisplaySettings() {
+  JsonDocument doc;
+  doc["brightness"] = brightnessLevel;
+  File file = LittleFS.open("/display.json", "w");
+  if (!file) return;
+  serializeJson(doc, file);
+  file.close();
+}
+
+void loadDisplaySettings() {
+  if (!LittleFS.exists("/display.json")) return;
+  File file = LittleFS.open("/display.json", "r");
+  if (!file) return;
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, file);
+  file.close();
+  if (error) return;
+  int level = doc["brightness"] | BRIGHTNESS_DEFAULT;
+  brightnessLevel = (uint8_t)constrain(level, BRIGHTNESS_MINIMUM, 255);
+}
+
+void setBrightness(int level) {
+  brightnessLevel = (uint8_t)constrain(level, BRIGHTNESS_MINIMUM, 255);
+  ledcWrite(LCD_BL, brightnessLevel);
+  saveDisplaySettings();
+  brightnessBannerUntil = millis() + 1200;
+  Serial.printf("Brightness: %u/255\n", brightnessLevel);
+}
+
 // ── Interaction handlers ──────────────────────────────────
 
 void triggerDoubleTap() {
@@ -1854,6 +1891,12 @@ void readTouch() {
 
     if (abs(dx) > 55 && abs(dx) > abs(dy)+18) {
       switchApp(dx < 0 ? 1 : -1);
+      touchWasDown = false;
+      touchMissFrames = 0;
+      touchMoved = false;
+      touchPortalArmed = false;
+    } else if (abs(dy) > 55 && abs(dy) > abs(dx)+18) {
+      setBrightness((int)brightnessLevel + (dy < 0 ? 24 : -24));
       touchWasDown = false;
       touchMissFrames = 0;
       touchMoved = false;
@@ -1967,8 +2010,8 @@ void setup() {
   if (!gfx->begin(40000000)) Serial.println("Display init failed — check wiring");
   lcdRegInit();
   display->setRotation(ROTATION);
-  pinMode(LCD_BL, OUTPUT);
-  digitalWrite(LCD_BL, HIGH);
+  ledcAttach(LCD_BL, 5000, 8);
+  ledcWrite(LCD_BL, brightnessLevel);
   gfx->fillScreen(BG);
   gfx->flush();
 
@@ -2030,12 +2073,15 @@ void setup() {
   // Keep reconnect attempts short so they don't stall the animation.
   wifiManager.setReconnectAttemptMs(WIFI_RETRY_WINDOW_MS);
   wifiManager.setReconnectBackoffMs(WIFI_RETRY_INTERVAL_MS);
+  wifiManager.setProtectedJsons({"/display.json"});
 
   // Note: deliberately NOT calling setProtectedJsons({"/wifi.json"}).
   // Whitelisting wifi.json would make the portal's "erase credentials"
   // button and the >=5 s button hold do nothing.
 
   wifiManager.begin();   // mounts LittleFS, loads stored credentials
+  loadDisplaySettings();
+  ledcWrite(LCD_BL, brightnessLevel);
 
   // Verify the portal's HTML is actually on the filesystem. Without it AWM
   // serves HTTP 500 and the user has no way to enter credentials.
@@ -2117,8 +2163,19 @@ void loop() {
     case 5: drawStock();      break;
     default: drawGithub();    break;
   }
-  // Auto-advance banner — shown briefly after double-tap
-  if (millis() < autoPageBannerUntil) {
+  // Brightness or auto-advance feedback banner — shown briefly after a gesture.
+  if (millis() < brightnessBannerUntil) {
+    char msg[20];
+    snprintf(msg, sizeof(msg), "BRIGHTNESS %u%%", (unsigned)(brightnessLevel * 100UL / 255UL));
+    uint16_t bannerColor = rgb(0,200,255);
+    gfx->setTextSize(1);
+    gfx->setTextColor(bannerColor);
+    int bw = (int)strlen(msg)*6;
+    gfx->fillRoundRect((SCREEN_W-bw-12)/2, SCREEN_H/2-10, bw+12, 20, 4, BG);
+    gfx->drawRoundRect((SCREEN_W-bw-12)/2, SCREEN_H/2-10, bw+12, 20, 4, bannerColor);
+    gfx->setCursor((SCREEN_W-bw)/2, SCREEN_H/2-4);
+    gfx->print(msg);
+  } else if (millis() < autoPageBannerUntil) {
     const char *msg = autoPageEnabled ? "AUTO: ON" : "AUTO: OFF";
     uint16_t bannerColor = autoPageEnabled ? rgb(0,200,80) : rgb(200,60,60);
     gfx->setTextSize(1);
