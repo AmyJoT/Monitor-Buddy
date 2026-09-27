@@ -64,6 +64,12 @@
 #define TEMP  "celsius"
 #define WIND  "kmh"
 
+// ── Spotify ─────────────────────────────────────────────────
+// Now playing. Run scripts/spotify_auth.py once, then paste the
+// printed client id and refresh token. No client secret is stored.
+#define SPOTIFY_CLIENT_ID     ""
+#define SPOTIFY_REFRESH_TOKEN ""
+
 // ── Pages ───────────────────────────────────────────────────
 // Toggle each page on (true) or off (false). Disabled pages are
 // skipped when swiping and auto-scrolling, and never fetch data.
@@ -75,4 +81,5 @@
 #define SHOW_WEATHER  true   // current weather (needs Wi-Fi)
 #define SHOW_MOON     true   // moon phase
 #define SHOW_STOCK    true   // stock ticker (needs Wi-Fi + Finnhub key)
-#define SHOW_GITHUB   true   // GitHub follower/repo stats (needs Wi-Fi)
+#define SHOW_GITHUB   true   // GitHub follower/repo stats (needs Wi-Fi)
+#define SHOW_SPOTIFY  false  // now playing (needs Wi-Fi + Spotify token)

@@ -6,7 +6,7 @@
 //           5 different themes available,
 //           Enable/Disable pages to customize your Buddy
 //           Touch swipe to change pages, 
-//           double tap to stop auto scrolling;
+//           double tap to toggle auto scrolling (off at boot);
 //           WifiManager creates a Wi-Fi hotspot with a
 //           captive portal so you can set your Wi-Fi up;
 //           tilt via QMI8658 IMU animates eyes.
@@ -83,7 +83,7 @@
 // Setup Wifi on first boot by connecting to the Monitor-Buddy access point (AP)
 // Press and hold the touch screen for 3 sec at any time later to redo the Wifi Setup (AP will start and you can configure your Monitor-Buddy
 // Swipe left/right to move through the different pages
-// Double Tap to disable and enable auto scrolling
+// Double Tap to enable and disable auto scrolling (starts off)
 // On the Face Page: single press the screen to switch to different faces
 //
 // Enjoy and have fun with Monitor-Buddy
@@ -103,6 +103,7 @@
 
 #include <LittleFS.h>
 #include <AyresWiFiManager.h>
+#include "face.h"
 
 // USER CONFIGURATION --------> EDIT config/config.h
 // Copy config/config.h.example to
@@ -251,7 +252,10 @@ void drawWeatherIcon(int cx, int cy, int code, bool isDay, uint16_t color);
 bool fetchWeather();
 bool fetchStock();
 bool fetchGithub();
-void drawFace(float tx, float ty);
+bool fetchSpotify();
+void drawSpotify();
+bool spotifyHandleTap(uint16_t x);
+void loadSpotifyToken();
 void drawDigitSegment(int x, int y, int w, int h, int t, uint8_t seg, uint16_t color);
 void drawDigit(int x, int y, uint8_t digit, int w, int h, int t, uint16_t color);
 void drawClock();
@@ -288,7 +292,8 @@ void resetSharedI2CBus() {
   Wire.end();
   delay(5);
   Wire.begin(TOUCH_SDA, TOUCH_SCL);
-  Wire.setClock(100000);
+  Wire.setClock(400000);
+  Wire.setTimeOut(3);
 }
 
 #define IMU_ADDRESS 0x6B
@@ -524,9 +529,7 @@ bool bsp_touch_get_coordinates(uint16_t *outX, uint16_t *outY) {
 }
 // ── End AXS5106L driver ────────────────────────────────────
 
-static const int SCREEN_W         = 320;
-static const int SCREEN_H         = 172;
-static const uint8_t APP_COUNT    = 7;   // total number of pages defined
+static const uint8_t APP_COUNT    = 8;   // total number of pages defined
 
 // Page identifiers, in fixed display order. These index the render switch in
 // loop(); which are actually shown is decided by the SHOW_* toggles above.
@@ -537,23 +540,15 @@ static constexpr uint8_t PAGE_WEATHER = 3;
 static constexpr uint8_t PAGE_MOON    = 4;
 static constexpr uint8_t PAGE_STOCK   = 5;
 static constexpr uint8_t PAGE_GITHUB  = 6;
+static constexpr uint8_t PAGE_SPOTIFY = 7;
 
-// -- Face expressions (ported from DESKBUDDY-1.0, Edison Science Corner) --
-// 9 moods, cycled by single-tapping the face page. A fast spin of the board
-// still snaps to SURPRISED (see readSensors).
-#define MOOD_NORMAL      0
-#define MOOD_HAPPY       1
-#define MOOD_SURPRISED   2
-#define MOOD_SLEEPY      3
-#define MOOD_ANGRY       4
-#define MOOD_SAD         5
-#define MOOD_EXCITED     6
-#define MOOD_LOVE        7
-#define MOOD_SUSPICIOUS  8
-static const uint8_t FACE_MOOD_COUNT = 9;
 static const uint32_t PAGE_AUTO_INTERVAL_MS = 8000;
-static const uint16_t FG = RGB565_WHITE;
-static const uint16_t BG = RGB565_BLACK;
+// extern: face.cpp draws with these. const at namespace scope is otherwise
+// internal linkage, so the extern is required.
+extern const int SCREEN_W = 320;
+extern const int SCREEN_H = 172;
+extern const uint16_t FG = RGB565_WHITE;
+extern const uint16_t BG = RGB565_BLACK;
 static const uint8_t ROTATION = 1;
 
 Arduino_DataBus *bus     = new Arduino_HWSPI(LCD_DC, LCD_CS, LCD_SCK, LCD_MOSI);
@@ -572,7 +567,7 @@ GyroData gyro;
 
 bool     imuReady        = false;
 bool     touchReady      = false;
-bool     autoPageEnabled  = true;
+bool     autoPageEnabled  = false;
 bool     touchWasDown    = false;
 bool     ntpSynced       = false;
 bool     weatherValid    = false;
@@ -585,7 +580,6 @@ uint8_t  currentApp      = 0;   // ID of the page currently shown (PAGE_*)
 uint8_t  pageOrder[APP_COUNT];  // enabled page IDs, built from SHOW_* at boot
 uint8_t  pageCount       = 0;   // how many pages are enabled
 uint8_t  currentPageIdx  = 0;   // index into pageOrder[] of the current page
-uint8_t  faceMood        = 0;
 uint16_t touchStartX     = 0;
 uint16_t touchStartY     = 0;
 uint16_t touchLastX      = 0;
@@ -873,6 +867,7 @@ void buildPageList() {
   if (SHOW_MOON)    pageOrder[pageCount++] = PAGE_MOON;
   if (SHOW_STOCK)   pageOrder[pageCount++] = PAGE_STOCK;
   if (SHOW_GITHUB)  pageOrder[pageCount++] = PAGE_GITHUB;
+  if (SHOW_SPOTIFY) pageOrder[pageCount++] = PAGE_SPOTIFY;
   if (pageCount == 0) pageOrder[pageCount++] = PAGE_FACE;  // never leave it empty
   if (currentPageIdx >= pageCount) currentPageIdx = 0;
   currentApp = pageOrder[currentPageIdx];
@@ -1103,26 +1098,269 @@ bool fetchGithub() {
   return true;
 }
 
-// -- Face rendering (DESKBUDDY-style expressive eyes) -------
-// Ported and scaled up from DESKBUDDY-1.0 (Edison Science Corner):
-//   https://github.com/EDISON-SCIENCE-CORNER/DESKBUDDY-1.0
-// The original targets a 128x64 mono OLED; here everything is scaled
-// ~2.5x for this 320x172 colour panel and driven by the same spring
-// physics: springy eyes, laggy pupils, blink, saccades and breathing.
-// IMU tilt is folded into the gaze so the eyes still follow the board.
+// ── Spotify now playing ───────────────────────────────────
+static constexpr uint32_t SPOTIFY_REFRESH_MS      = 15000UL;
+static constexpr uint32_t SPOTIFY_BACKOFF_MS      = 30000UL;
+static constexpr uint32_t SPOTIFY_HTTP_TIMEOUT_MS = 1500UL;
+static constexpr uint32_t SPOTIFY_MARQUEE_STEP_MS = 220UL;
 
-// Emotion particle bitmaps (16x16, 1-bit), drawn scaled 2x.
-static const unsigned char bmp_heart[] PROGMEM = {
-  0x00,0x00,0x0c,0x60,0x1e,0xf0,0x3f,0xf8,0x7f,0xfc,0x7f,0xfc,0x7f,0xfc,0x3f,0xf8,
-  0x1f,0xf0,0x0f,0xe0,0x07,0xc0,0x03,0x80,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00 };
-static const unsigned char bmp_zzz[] PROGMEM = {
-  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x3c,0x00,0x0c,0x00,0x18,0x00,0x30,0x00,0x7e,
-  0x00,0x00,0x3c,0x00,0x0c,0x00,0x18,0x00,0x30,0x00,0x7c,0x00,0x00,0x00,0x00,0x00 };
-static const unsigned char bmp_anger[] PROGMEM = {
-  0x00,0x00,0x11,0x10,0x2a,0x90,0x44,0x40,0x80,0x20,0x80,0x20,0x44,0x40,0x2a,0x90,
-  0x11,0x10,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 };
+static char spotifyTitle[64];
+static char spotifyArtist[48];
+static char spotifyDevice[24];
+static char spotifyAccess[512];
+static char spotifyRefresh[320];
+static uint32_t spotifyTokenMs = 0;
+static uint32_t spotifyTokenTtl = 0;
+static uint32_t spotifyProgressMs = 0;
+static uint32_t spotifyDurationMs = 0;
+static uint32_t spotifySampledAt = 0;
+static uint32_t spotifyAttemptedAt = 0;
+static uint32_t spotifyBackoffUntil = 0;
+static bool spotifyPlaying = false;
+static bool spotifyValid = false;
+static bool spotifyNothing = false;
+static bool spotifyAuthError = false;
+static char spotifyActionMessage[20];
+static uint32_t spotifyActionUntil = 0;
+static uint8_t spotifyView = 0;
+static const uint8_t SPOTIFY_VIEW_COUNT = 2;
+
+struct SpotifyTheme {
+  uint16_t background;
+  uint16_t panel;
+  uint16_t accent;
+  uint16_t text;
+  uint16_t muted;
+};
+
+static SpotifyTheme spotifyThemeForTrack() {
+  uint32_t hash = 2166136261UL;
+  for (const char *text : {spotifyTitle, spotifyArtist}) {
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+      hash ^= *p;
+      hash *= 16777619UL;
+    }
+  }
+  switch (hash % 6) {
+    case 0: return {rgb(7, 12, 22),  rgb(14, 24, 40), rgb(40, 190, 220), FG, rgb(145, 175, 195)};
+    case 1: return {rgb(25, 9, 17),  rgb(45, 16, 30),  rgb(245, 95, 145), FG, rgb(205, 150, 175)};
+    case 2: return {rgb(25, 16, 5),  rgb(46, 29, 8),   rgb(245, 180, 55), FG, rgb(205, 175, 125)};
+    case 3: return {rgb(5, 22, 19),  rgb(9, 42, 35),   rgb(45, 210, 155), FG, rgb(145, 195, 180)};
+    case 4: return {rgb(22, 10, 25),  rgb(40, 18, 45),  rgb(205, 105, 235), FG, rgb(190, 155, 200)};
+    default:return {rgb(18, 22, 7),  rgb(34, 42, 10),  rgb(170, 220, 55), FG, rgb(175, 195, 125)};
+  }
+}
+
+static void copyTrunc(char *dst, size_t cap, const char *src) {
+  if (!dst || cap == 0) return;
+  if (!src) src = "";
+  size_t i = 0;
+  for (; i + 1 < cap && src[i]; i++) dst[i] = src[i];
+  dst[i] = 0;
+}
+
+static void appendTrunc(char *dst, size_t cap, const char *src) {
+  size_t n = strlen(dst);
+  if (n >= cap) return;
+  copyTrunc(dst + n, cap - n, src);
+}
+
+static void urlEncodeInto(char *dst, size_t cap, const char *src) {
+  static const char hex[] = "0123456789ABCDEF";
+  size_t n = 0;
+  for (; src && *src && n + 4 < cap; src++) {
+    unsigned char c = (unsigned char)*src;
+    bool plain = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                 (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~';
+    if (plain) dst[n++] = (char)c;
+    else {
+      dst[n++] = '%';
+      dst[n++] = hex[c >> 4];
+      dst[n++] = hex[c & 15];
+    }
+  }
+  dst[n] = 0;
+}
+
+static bool spotifyConfigured() {
+  return strlen(SPOTIFY_CLIENT_ID) > 0 && spotifyRefresh[0] != 0;
+}
+
+static void saveSpotifyRefresh(const char *token) {
+  copyTrunc(spotifyRefresh, sizeof(spotifyRefresh), token);
+  JsonDocument doc;
+  doc["refresh"] = spotifyRefresh;
+  File file = LittleFS.open("/spotify.json", "w");
+  if (!file) return;
+  serializeJson(doc, file);
+  file.close();
+}
+
+void loadSpotifyToken() {
+  copyTrunc(spotifyRefresh, sizeof(spotifyRefresh), SPOTIFY_REFRESH_TOKEN);
+  if (!LittleFS.exists("/spotify.json")) return;
+  File file = LittleFS.open("/spotify.json", "r");
+  if (!file) return;
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, file);
+  file.close();
+  if (error) return;
+  const char *saved = doc["refresh"] | "";
+  if (saved[0]) copyTrunc(spotifyRefresh, sizeof(spotifyRefresh), saved);
+}
+
+static bool refreshSpotifyToken(const char *refresh) {
+  if (!refresh || !refresh[0] || !SPOTIFY_CLIENT_ID[0]) return false;
+  static char encoded[960];
+  static char body[1100];
+  urlEncodeInto(encoded, sizeof(encoded), refresh);
+  snprintf(body, sizeof(body),
+           "grant_type=refresh_token&client_id=%s&refresh_token=%s",
+           SPOTIFY_CLIENT_ID, encoded);
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(SPOTIFY_HTTP_TIMEOUT_MS);
+  if (!http.begin(client, "https://accounts.spotify.com/api/token")) return false;
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  int code = http.POST((uint8_t *)body, strlen(body));
+  if (code != HTTP_CODE_OK) {
+    if (code == 400) spotifyAuthError = true;
+    http.end();
+    return false;
+  }
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, http.getString());
+  http.end();
+  if (err) return false;
+  const char *access = doc["access_token"] | "";
+  if (!access[0]) return false;
+  copyTrunc(spotifyAccess, sizeof(spotifyAccess), access);
+  uint32_t expires = doc["expires_in"] | 3600;
+  if (expires > 120) expires -= 60;
+  spotifyTokenMs = millis();
+  spotifyTokenTtl = expires * 1000UL;
+  copyTrunc(spotifyRefresh, sizeof(spotifyRefresh), refresh);
+  const char *rotated = doc["refresh_token"] | "";
+  if (rotated[0]) copyTrunc(spotifyRefresh, sizeof(spotifyRefresh), rotated);
+  saveSpotifyRefresh(spotifyRefresh);
+  spotifyAuthError = false;
+  return true;
+}
+
+static bool ensureSpotifyAccess() {
+  if (spotifyAccess[0] && (millis() - spotifyTokenMs) < spotifyTokenTtl) return true;
+  if (refreshSpotifyToken(spotifyRefresh)) return true;
+  if (SPOTIFY_REFRESH_TOKEN[0] && strcmp(spotifyRefresh, SPOTIFY_REFRESH_TOKEN) != 0) {
+    if (refreshSpotifyToken(SPOTIFY_REFRESH_TOKEN)) return true;
+  }
+  return false;
+}
+
+static void markSpotifyIdle() {
+  spotifyNothing = true;
+  spotifyPlaying = false;
+  spotifyValid = true;
+  spotifyTitle[0] = 0;
+  spotifyAuthError = false;
+}
+
+static bool fetchSpotifyPlayer(bool retried);
+
+static bool fetchSpotifyPlayer(bool retried) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(SPOTIFY_HTTP_TIMEOUT_MS);
+  if (!http.begin(client, "https://api.spotify.com/v1/me/player")) return false;
+  char auth[560];
+  snprintf(auth, sizeof(auth), "Bearer %s", spotifyAccess);
+  http.addHeader("Authorization", auth);
+  int code = http.GET();
+  if (code == 401) {
+    http.end();
+    spotifyAccess[0] = 0;
+    if (retried || !ensureSpotifyAccess()) {
+      spotifyAuthError = true;
+      return false;
+    }
+    return fetchSpotifyPlayer(true);
+  }
+  if (code == 429) {
+    http.end();
+    spotifyBackoffUntil = millis() + SPOTIFY_BACKOFF_MS;
+    Serial.println("Spotify: rate limited");
+    return false;
+  }
+  if (code == 204) {
+    http.end();
+    markSpotifyIdle();
+    Serial.println("Spotify: nothing playing");
+    return true;
+  }
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    Serial.printf("Spotify: HTTP %d\n", code);
+    return false;
+  }
+  JsonDocument filter;
+  filter["is_playing"] = true;
+  filter["progress_ms"] = true;
+  filter["device"]["name"] = true;
+  filter["item"]["name"] = true;
+  filter["item"]["type"] = true;
+  filter["item"]["duration_ms"] = true;
+  filter["item"]["artists"][0]["name"] = true;
+  filter["item"]["show"]["name"] = true;
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+  http.end();
+  if (err) return false;
+  const char *title = doc["item"]["name"] | "";
+  if (doc["item"].isNull() || !title[0]) {
+    markSpotifyIdle();
+    Serial.println("Spotify: nothing playing");
+    return true;
+  }
+  copyTrunc(spotifyTitle, sizeof(spotifyTitle), title);
+  const char *type = doc["item"]["type"] | "track";
+  if (strcmp(type, "episode") == 0) {
+    copyTrunc(spotifyArtist, sizeof(spotifyArtist), doc["item"]["show"]["name"] | "");
+  } else {
+    spotifyArtist[0] = 0;
+    int n = 0;
+    for (JsonObject artist : doc["item"]["artists"].as<JsonArray>()) {
+      const char *name = artist["name"] | "";
+      if (!name[0]) continue;
+      if (n) appendTrunc(spotifyArtist, sizeof(spotifyArtist), ", ");
+      appendTrunc(spotifyArtist, sizeof(spotifyArtist), name);
+      if (++n >= 2) break;
+    }
+  }
+  copyTrunc(spotifyDevice, sizeof(spotifyDevice), doc["device"]["name"] | "");
+  spotifyProgressMs = doc["progress_ms"] | 0;
+  spotifyDurationMs = doc["item"]["duration_ms"] | 0;
+  spotifyPlaying = doc["is_playing"] | false;
+  spotifySampledAt = millis();
+  spotifyNothing = false;
+  spotifyValid = true;
+  spotifyAuthError = false;
+  Serial.println("Spotify: updated");
+  return true;
+}
+
+bool fetchSpotify() {
+  if (!spotifyConfigured() || !ensureWifi()) return false;
+  if (!ensureSpotifyAccess()) {
+    spotifyBackoffUntil = millis() + SPOTIFY_BACKOFF_MS;
+    Serial.println("Spotify: auth failed");
+    return false;
+  }
+  return fetchSpotifyPlayer(false);
+}
 
 // GitHub 'mark' logo, 56x56 1-bit (octicons mark-github, rasterised).
+// Face bitmaps and the mood table live in face.cpp.
 static const unsigned char bmp_github[] PROGMEM = {
   0x00,0x00,0x01,0xff,0x80,0x00,0x00,
   0x00,0x00,0x1f,0xff,0xf8,0x00,0x00,
@@ -1184,49 +1422,6 @@ static const unsigned char bmp_github[] PROGMEM = {
 static const int GH_W = 56, GH_H = 56;
 
 
-// Eye geometry on the 320x172 canvas (centres, not top-left).
-static const float FACE_LEFT_CX  = 105.0f;
-static const float FACE_RIGHT_CX = 215.0f;
-static const float FACE_EYES_CY  = 80.0f;
-
-// One eye: animated CENTRE (x,y) + size (w,h), plus a pupil that lags behind.
-// Each quantity is a critically-ish damped spring toward its target.
-struct Eye {
-  float x, y, w, h;
-  float targetX, targetY, targetW, targetH;
-  float pupilX, pupilY, targetPupilX, targetPupilY;
-  float velX = 0, velY = 0, velW = 0, velH = 0, pVelX = 0, pVelY = 0;
-  float k  = 0.12f;   // eye spring
-  float d  = 0.60f;   // eye damping (heavier feel)
-  float pk = 0.08f;   // pupil spring (softer/laggier)
-  float pd = 0.50f;   // pupil damping
-  bool  blinking = false;
-  unsigned long lastBlink = 0, nextBlinkTime = 0;
-
-  void init(float _x, float _y, float _w, float _h) {
-    x = targetX = _x; y = targetY = _y;
-    w = targetW = _w; h = targetH = _h;
-    pupilX = targetPupilX = 0; pupilY = targetPupilY = 0;
-    nextBlinkTime = millis() + random(1000, 4000);
-  }
-  void update() {
-    velX = (velX + (targetX - x) * k) * d;
-    velY = (velY + (targetY - y) * k) * d;
-    velW = (velW + (targetW - w) * k) * d;
-    velH = (velH + (targetH - h) * k) * d;
-    x += velX; y += velY; w += velW; h += velH;
-    pVelX = (pVelX + (targetPupilX - pupilX) * pk) * pd;
-    pVelY = (pVelY + (targetPupilY - pupilY) * pk) * pd;
-    pupilX += pVelX; pupilY += pVelY;
-  }
-};
-
-Eye leftEye, rightEye;
-static unsigned long lastSaccade     = 0;
-static unsigned long saccadeInterval = 3000;
-static float gazeLX = 0.0f, gazeLY = 0.0f;   // current saccade gaze target
-static float breathVal = 0.0f;
-
 // Draw a 1-bit bitmap scaled by an integer factor (nearest neighbour).
 void drawBitmapScaled(int x, int y, const uint8_t *bmp, int w, int h, int scale, uint16_t color) {
   int bytesPerRow = (w + 7) / 8;
@@ -1236,230 +1431,6 @@ void drawBitmapScaled(int x, int y, const uint8_t *bmp, int w, int h, int scale,
       if (b & (0x80 >> (col & 7)))
         gfx->fillRect(x + col * scale, y + row * scale, scale, scale, color);
     }
-}
-
-// Black "eyelid" fills that carve each mood's expression into the sclera.
-// Proportional to eye size so they scale with the mood shapes.
-void drawEyelidMask(int ix, int iy, int iw, int ih, uint8_t mood, bool isLeft) {
-  int slant = (int)(iw * 0.167f);
-  int band  = (int)(ih * 0.44f);
-  if (mood == MOOD_ANGRY) {                       // brows angled in
-    for (int i = 0; i < band; i++)
-      if (isLeft) gfx->drawLine(ix, iy + i,         ix + iw, iy - slant + i, BG);
-      else        gfx->drawLine(ix, iy - slant + i, ix + iw, iy + i,         BG);
-  } else if (mood == MOOD_SAD) {                  // brows angled out (inverse)
-    for (int i = 0; i < band; i++)
-      if (isLeft) gfx->drawLine(ix, iy - slant + i, ix + iw, iy + i,         BG);
-      else        gfx->drawLine(ix, iy + i,         ix + iw, iy - slant + i, BG);
-  } else if (mood == MOOD_SLEEPY) {               // heavy top lids
-    gfx->fillRect(ix, iy, iw, ih / 2 + 5, BG);
-  } else if (mood == MOOD_SUSPICIOUS) {           // one squint, one wide
-    if (isLeft) gfx->fillRect(ix, iy, iw, ih / 2 - 5, BG);
-    else        gfx->fillRect(ix, iy + ih - (int)(ih * 0.22f), iw, (int)(ih * 0.22f), BG);
-  }
-}
-
-// Draw one eye: white sclera, laggy black pupil, glint, then the eyelid mask.
-void drawEyeShape(Eye &e, bool isLeft) {
-  int iw = (int)e.w, ih = (int)e.h;
-  if (iw < 2 || ih < 2) return;
-  int ix = (int)(e.x - e.w / 2.0f);
-  int iy = (int)(e.y - e.h / 2.0f);
-
-  int r  = (iw < 50) ? 6 : 16;
-  // Angry = red eyes (hard-coded face colour, not affected by THEME).
-  uint16_t sclera = (faceMood == MOOD_ANGRY) ? rgb(255, 80, 90) : FG;
-  gfx->fillRoundRect(ix, iy, iw, ih, r, sclera);
-
-  int cx = ix + iw / 2, cy = iy + ih / 2;
-  int pw = (int)(iw / 2.2f), ph = (int)(ih / 2.2f);
-
-  if (faceMood == MOOD_HAPPY) {
-    // Bright, cheerful open eyes: normal pupil, twin glints, no eyelid mask.
-    // Rosy blush cheeks are added in drawFace().
-    int px = cx + (int)e.pupilX - pw / 2;
-    int py = cy + (int)e.pupilY - ph / 2;
-    if (px < ix) px = ix;
-    if (px + pw > ix + iw) px = ix + iw - pw;
-    if (py < iy) py = iy;
-    if (py + ph > iy + ih) py = iy + ih - ph;
-    gfx->fillRoundRect(px, py, pw, ph, r / 2, BG);
-    gfx->fillCircle(px + pw - 10, py + 10, 5, FG);   // main glint
-    gfx->fillCircle(px + 9, py + ph - 11, 3, FG);    // second glint
-    return;
-  }
-
-  if (faceMood == MOOD_EXCITED) {
-    // Wide, shiny eyes: an oversized pupil, twin gold glints, and a gold sparkle
-    // (hard-coded face colour, not affected by THEME).
-    uint16_t gold = rgb(255, 210, 60);
-    pw = (int)(iw / 1.85f); ph = (int)(ih / 1.85f);
-    int px = cx + (int)e.pupilX - pw / 2;
-    int py = cy + (int)e.pupilY - ph / 2;
-    if (px < ix) px = ix;
-    if (px + pw > ix + iw) px = ix + iw - pw;
-    if (py < iy) py = iy;
-    if (py + ph > iy + ih) py = iy + ih - ph;
-    gfx->fillRoundRect(px, py, pw, ph, r / 2, BG);
-    gfx->fillCircle(px + pw - 10, py + 10, 5, gold);   // main glint (gold)
-    gfx->fillCircle(px + 9, py + ph - 11, 3, gold);    // second glint (gold)
-    int sx = isLeft ? (ix - 2) : (ix + iw + 2);      // sparkle on the outer side
-    int sy = iy + 2;
-    gfx->fillRect(sx - 7, sy - 1, 15, 3, gold);
-    gfx->fillRect(sx - 1, sy - 7, 3, 15, gold);
-    return;
-  }
-
-  if (faceMood == MOOD_LOVE) {
-    // Heart-shaped pupil: reuse the 16x16 heart icon, drawn in BG on the sclera,
-    // scaled to the pupil size and following the same gaze offset. Eyes stay fully
-    // open (no eyelid mask for LOVE), so both hearts are always visible.
-    int scale = pw / 6;
-    if (scale < 2) scale = 2;
-    if (scale > 4) scale = 4;
-    int hw = 16 * scale, hh = 16 * scale;
-    int hx = cx + (int)e.pupilX - hw / 2;
-    int hy = cy + (int)e.pupilY - hh / 2;
-    if (hx < ix) hx = ix;
-    if (hx + hw > ix + iw) hx = ix + iw - hw;
-    if (hy < iy) hy = iy;
-    if (hy + hh > iy + ih) hy = iy + ih - hh;
-    drawBitmapScaled(hx, hy, bmp_heart, 16, 16, scale, BG);
-  } else {
-    int px = cx + (int)e.pupilX - pw / 2;
-    int py = cy + (int)e.pupilY - ph / 2;
-    if (px < ix) px = ix;
-    if (px + pw > ix + iw) px = ix + iw - pw;
-    if (py < iy) py = iy;
-    if (py + ph > iy + ih) py = iy + ih - ph;
-    gfx->fillRoundRect(px, py, pw, ph, r / 2, BG);
-    if (iw > 30 && ih > 30) gfx->fillCircle(px + pw - 10, py + 10, 5, FG);   // glint
-  }
-
-  drawEyelidMask(ix, iy, iw, ih, faceMood, isLeft);
-}
-
-// Advance springs, blink, saccades, breathing and the per-mood eye shapes.
-// tiltX/tiltY are the IMU-derived tilt (-1..1) so the gaze tracks the board.
-void updateFacePhysics(float tiltX, float tiltY) {
-  unsigned long now = millis();
-  breathVal = sin(now / 800.0f) * 3.5f;
-
-  // Blink (both eyes together, off the left eye's timer).
-  if (now > leftEye.nextBlinkTime) {
-    leftEye.blinking = rightEye.blinking = true;
-    leftEye.lastBlink = now;
-    leftEye.nextBlinkTime = now + random(2000, 6000);
-  }
-  if (leftEye.blinking && now - leftEye.lastBlink > 120)
-    leftEye.blinking = rightEye.blinking = false;
-
-  // Saccade: occasionally jump the gaze to a new random direction.
-  if (!leftEye.blinking && now - lastSaccade > saccadeInterval) {
-    lastSaccade = now;
-    saccadeInterval = random(500, 3000);
-    int dir = random(0, 10);
-    if      (dir < 4)  { gazeLX = 0;   gazeLY = 0;   }   // centre
-    else if (dir == 4) { gazeLX = -15; gazeLY = -10; }   // TL
-    else if (dir == 5) { gazeLX = 15;  gazeLY = -10; }   // TR
-    else if (dir == 6) { gazeLX = -15; gazeLY = 10;  }   // BL
-    else if (dir == 7) { gazeLX = 15;  gazeLY = 10;  }   // BR
-    else if (dir == 8) { gazeLX = 20;  gazeLY = 0;   }   // R
-    else               { gazeLX = -20; gazeLY = 0;   }   // L
-  }
-
-  // Gaze target = saccade offset + live IMU tilt, applied every frame.
-  float pupX = gazeLX + tiltX * 20.0f;
-  float pupY = gazeLY + tiltY * 12.0f;
-  leftEye.targetPupilX  = rightEye.targetPupilX = pupX;
-  leftEye.targetPupilY  = rightEye.targetPupilY = pupY;
-  leftEye.targetX  = FACE_LEFT_CX  + gazeLX * 0.3f + tiltX * 8.0f;
-  rightEye.targetX = FACE_RIGHT_CX + gazeLX * 0.3f + tiltX * 8.0f;
-  leftEye.targetY  = rightEye.targetY = FACE_EYES_CY + gazeLY * 0.3f + tiltY * 6.0f;
-
-  if (leftEye.blinking) {
-    leftEye.targetH = rightEye.targetH = 4;                 // slam shut
-  } else {
-    switch (faceMood) {
-      case MOOD_HAPPY:
-        // Big open eyes + blush cheeks (drawn in drawEyeShape / drawFace).
-        leftEye.targetW = rightEye.targetW = 92;
-        leftEye.targetH = rightEye.targetH = 92;
-        leftEye.targetPupilY  -= 6;   // gaze slightly up = cheerful
-        rightEye.targetPupilY -= 6;   break;
-      case MOOD_LOVE:
-        // Wide-open, fully-visible round eyes (heart pupils drawn in drawEyeShape).
-        leftEye.targetW = rightEye.targetW = 96;
-        leftEye.targetH = rightEye.targetH = 96;  break;
-      case MOOD_SURPRISED:
-        leftEye.targetW = rightEye.targetW = 75;
-        leftEye.targetH = rightEye.targetH = 112;
-        leftEye.targetPupilX  += random(-3, 4);             // jitter
-        rightEye.targetPupilX += random(-3, 4); break;
-      case MOOD_SLEEPY:
-        leftEye.targetW = rightEye.targetW = 95;
-        leftEye.targetH = rightEye.targetH = 75;  break;
-      case MOOD_ANGRY:
-        leftEye.targetW = rightEye.targetW = 85;
-        leftEye.targetH = rightEye.targetH = 80;  break;
-      case MOOD_SAD:
-        leftEye.targetW = rightEye.targetW = 85;
-        leftEye.targetH = rightEye.targetH = 100; break;
-      case MOOD_EXCITED:
-        // Tall, wide-open shiny eyes (big pupil + twin glints + sparkle).
-        leftEye.targetW = rightEye.targetW = 90;
-        leftEye.targetH = rightEye.targetH = 106 + breathVal;
-        leftEye.targetPupilY  += random(-2, 3);
-        rightEye.targetPupilY += random(-2, 3); break;
-      case MOOD_SUSPICIOUS:
-        leftEye.targetW  = 90;  leftEye.targetH  = 50;      // squint
-        rightEye.targetW = 90;  rightEye.targetH = 105;     // wide
-        break;
-      case MOOD_NORMAL:
-      default:
-        leftEye.targetW = rightEye.targetW = 90;
-        leftEye.targetH = rightEye.targetH = 90 + breathVal; break;
-    }
-  }
-
-  leftEye.update();
-  rightEye.update();
-}
-
-void drawFace(float tx, float ty) {
-  gfx->fillScreen(BG);
-  updateFacePhysics(tx, ty);
-
-  // Floating emotion particles (scaled 2x from DESKBUDDY's 16x16 icons).
-  if (faceMood == MOOD_LOVE) {
-    drawBitmapScaled(18,  8, bmp_heart, 16, 16, 2, FG);
-    drawBitmapScaled(270, 8, bmp_heart, 16, 16, 2, FG);
-  } else if (faceMood == MOOD_SLEEPY) {
-    drawBitmapScaled(144, 6, bmp_zzz, 16, 16, 2, FG);   // centred between the eyes
-  } else if (faceMood == MOOD_ANGRY) {
-    drawBitmapScaled(144, 8, bmp_anger, 16, 16, 2, FG); // centred between the eyes
-  }
-
-  drawEyeShape(leftEye, true);
-  drawEyeShape(rightEye, false);
-
-  // HAPPY: soft rosy blush cheeks at the lower-outer corners of the eyes.
-  if (faceMood == MOOD_HAPPY) {
-    uint16_t blush = rgb(255, 120, 150);
-    gfx->fillCircle(70,  126, 13, blush);
-    gfx->fillCircle(250, 126, 13, blush);
-  }
-
-  // Small offline hint on the face page so the user knows setup is available.
-  if (!wifiManager.isConnected()) {
-    gfx->setTextSize(1);
-    gfx->setTextColor(rgb(150,150,150));
-    const char *msg = wifiConfigured() ? "WIFI OFFLINE" : "HOLD TO SET UP WIFI";
-    int w = (int)strlen(msg)*6;
-    gfx->setCursor((SCREEN_W-w)/2, 6);
-    gfx->print(msg);
-  }
-  drawPageDots();
 }
 
 // ── 7-segment clock ───────────────────────────────────────
@@ -1689,6 +1660,213 @@ void drawGithub() {
   drawPageDots();
 }
 
+static void formatClockMs(char *out, size_t n, uint32_t ms) {
+  uint32_t s = ms / 1000UL;
+  snprintf(out, n, "%lu:%02lu", (unsigned long)(s / 60UL), (unsigned long)(s % 60UL));
+}
+
+static void drawMarquee(const char *text, int y, uint8_t size, uint16_t color) {
+  int charW = 6 * size;
+  int margin = 8;
+  int avail = SCREEN_W - margin * 2;
+  int maxChars = avail / charW;
+  int textLen = (int)strlen(text);
+  int offset = 0;
+  if (textLen > maxChars) {
+    int gap = 4;
+    int period = textLen + gap;
+    offset = (int)((millis() / SPOTIFY_MARQUEE_STEP_MS) % (uint32_t)period);
+  }
+  char visible[64];
+  int visibleLen = textLen > maxChars ? maxChars : textLen;
+  for (int i = 0; i < visibleLen; i++) {
+    int source = offset + i;
+    visible[i] = source < textLen ? text[source] : ' ';
+    if (source >= textLen + 4) visible[i] = text[source - (textLen + 4)];
+  }
+  visible[visibleLen] = 0;
+  int textW = visibleLen * charW;
+  gfx->setTextSize(size);
+  gfx->setTextColor(color);
+  gfx->setCursor((SCREEN_W - textW) / 2, y);
+  gfx->print(visible);
+}
+
+static void drawMarqueeBox(const char *text, int x, int y, int width,
+                           uint8_t size, uint16_t color) {
+  int charW = 6 * size;
+  int maxChars = width / charW;
+  int textLen = (int)strlen(text);
+  int offset = 0;
+  if (textLen > maxChars) {
+    int gap = 4;
+    int period = textLen + gap;
+    offset = (int)((millis() / SPOTIFY_MARQUEE_STEP_MS) % (uint32_t)period);
+  }
+  char visible[64];
+  int visibleLen = textLen > maxChars ? maxChars : textLen;
+  for (int i = 0; i < visibleLen; i++) {
+    int source = offset + i;
+    visible[i] = source < textLen ? text[source] : ' ';
+    if (source >= textLen + 4) visible[i] = text[source - (textLen + 4)];
+  }
+  visible[visibleLen] = 0;
+  int textW = visibleLen * charW;
+  gfx->setTextSize(size);
+  gfx->setTextColor(color);
+  gfx->setCursor(x + (width - textW) / 2, y);
+  gfx->print(visible);
+}
+
+static void cycleSpotifyView(int8_t delta) {
+  spotifyView = (uint8_t)((spotifyView + SPOTIFY_VIEW_COUNT + delta) % SPOTIFY_VIEW_COUNT);
+  copyTrunc(spotifyActionMessage, sizeof(spotifyActionMessage),
+            spotifyView == 1 ? "VINYL VIEW" : "DETAIL VIEW");
+  spotifyActionUntil = millis() + 1200;
+}
+
+static void drawVinylArc(int cx, int cy, int radius, float start, uint16_t color) {
+  const int segments = 5;
+  const float span = 1.15f;
+  for (int i = 0; i < segments; i++) {
+    float a1 = start + span * i / segments;
+    float a2 = start + span * (i + 1) / segments;
+    gfx->drawLine(cx + (int)(cos(a1) * radius), cy + (int)(sin(a1) * radius),
+                  cx + (int)(cos(a2) * radius), cy + (int)(sin(a2) * radius), color);
+  }
+}
+
+static void drawSpotifyVinyl(const SpotifyTheme &theme) {
+  const int cx = 72;
+  const int cy = 96;
+  const int radius = 55;
+  gfx->fillRect(0, 0, SCREEN_W, 4, theme.accent);
+  gfx->setTextSize(1);
+  gfx->setTextColor(theme.muted);
+  gfx->setCursor(12, 12);
+  gfx->print(spotifyPlaying ? "PLAYING" : "PAUSED");
+  if (spotifyDevice[0]) {
+    int deviceW = (int)strlen(spotifyDevice) * 6;
+    gfx->setCursor(SCREEN_W - deviceW - 12, 12);
+    gfx->print(spotifyDevice);
+  }
+
+  gfx->fillCircle(cx, cy, radius, theme.panel);
+  float spin = millis() / 900.0f;
+  for (int groove = 16; groove < radius - 2; groove += 12) {
+    drawVinylArc(cx, cy, groove, spin + groove * 0.04f, theme.muted);
+    drawVinylArc(cx, cy, groove, spin + 3.14f + groove * 0.04f, theme.muted);
+  }
+  gfx->drawCircle(cx, cy, radius, theme.accent);
+  gfx->fillCircle(cx, cy, 17, theme.accent);
+  gfx->fillCircle(cx, cy, 4, rgb(8, 8, 10));
+  gfx->drawLine(cx + 36, cy - 42, cx + 58, cy - 42, theme.accent);
+  gfx->drawLine(cx + 58, cy - 42, cx + 50, cy - 10, theme.accent);
+  gfx->fillCircle(cx + 49, cy - 9, 4, theme.accent);
+
+  const int rightX = 150;
+  const int rightW = SCREEN_W - rightX - 10;
+  drawMarqueeBox(spotifyTitle, rightX, 50, rightW, 2, theme.text);
+  if (spotifyArtist[0]) drawMarqueeBox(spotifyArtist, rightX, 80, rightW, 1, theme.muted);
+
+  uint32_t shown = spotifyProgressMs;
+  if (spotifyPlaying && spotifyDurationMs) {
+    uint32_t add = millis() - spotifySampledAt;
+    shown = spotifyProgressMs + add;
+    if (shown > spotifyDurationMs) shown = spotifyDurationMs;
+  }
+  const int barW = 146;
+  gfx->fillRoundRect(rightX, 112, barW, 10, 4, theme.panel);
+  int fill = spotifyDurationMs ? (int)((uint64_t)shown * (uint32_t)barW / spotifyDurationMs) : 0;
+  if (fill > 2) gfx->fillRoundRect(rightX, 112, fill, 10, 4, theme.accent);
+  char left[12], right[12];
+  formatClockMs(left, sizeof(left), shown);
+  formatClockMs(right, sizeof(right), spotifyDurationMs);
+  gfx->setTextColor(theme.muted);
+  gfx->setCursor(rightX, 126);
+  gfx->print(left);
+  gfx->setCursor(rightX + barW - (int)strlen(right) * 6, 126);
+  gfx->print(right);
+  if ((int32_t)(millis() - spotifyActionUntil) < 0)
+    centeredTextColor(spotifyActionMessage, 144, 1, theme.accent);
+}
+
+bool spotifyHandleTap(uint16_t x) {
+  (void)x;
+  return false;
+}
+
+void drawSpotify() {
+  SpotifyTheme theme = spotifyThemeForTrack();
+  gfx->fillScreen(spotifyValid && !spotifyNothing && spotifyTitle[0] ? theme.background : BG);
+  if (drawWifiGate()) return;
+  if (!spotifyConfigured()) {
+    centeredText("SET SPOTIFY", 50, 3);
+    centeredText("RUN AUTH SCRIPT", 100, 2);
+    drawPageDots();
+    return;
+  }
+  if (spotifyAuthError && !spotifyValid) {
+    centeredText("SPOTIFY LOGIN", 60, 3);
+    centeredText("TOKEN REJECTED", 100, 2);
+    drawPageDots();
+    return;
+  }
+  if (!spotifyValid) {
+    centeredText("UPDATING", 74, 3);
+    drawPageDots();
+    return;
+  }
+  if (spotifyNothing || !spotifyTitle[0]) {
+    centeredText("NOTHING PLAYING", 70, 2);
+    drawPageDots();
+    return;
+  }
+  if (spotifyView == 1) {
+    drawSpotifyVinyl(theme);
+    drawPageDots();
+    return;
+  }
+
+  gfx->fillRect(0, 0, SCREEN_W, 4, theme.accent);
+  gfx->setTextSize(1);
+  gfx->setTextColor(theme.muted);
+  gfx->setCursor(12, 12);
+  gfx->print(spotifyPlaying ? "NOW PLAYING" : "PAUSED");
+  drawMarquee(spotifyTitle, 30, 2, theme.text);
+  if (spotifyArtist[0]) drawMarquee(spotifyArtist, 58, 1, theme.muted);
+  if (spotifyDevice[0]) {
+    gfx->setTextSize(1);
+    gfx->setTextColor(theme.muted);
+    int deviceW = (int)strlen(spotifyDevice) * 6;
+    gfx->setCursor((SCREEN_W - deviceW) / 2, 82);
+    gfx->print(spotifyDevice);
+  }
+  if ((int32_t)(millis() - spotifyActionUntil) < 0)
+    centeredTextColor(spotifyActionMessage, 94, 1, theme.accent);
+  uint32_t shown = spotifyProgressMs;
+  if (spotifyPlaying && spotifyDurationMs) {
+    uint32_t add = millis() - spotifySampledAt;
+    shown = spotifyProgressMs + add;
+    if (shown > spotifyDurationMs) shown = spotifyDurationMs;
+  }
+  int barX = 16;
+  int barW = SCREEN_W - 32;
+  int barY = 106;
+  gfx->fillRoundRect(barX, barY, barW, 10, 4, theme.panel);
+  int fill = spotifyDurationMs ? (int)((uint64_t)shown * (uint32_t)barW / spotifyDurationMs) : 0;
+  if (fill > 2) gfx->fillRoundRect(barX, barY, fill, 10, 4, theme.accent);
+  char left[12], right[12];
+  formatClockMs(left, sizeof(left), shown);
+  formatClockMs(right, sizeof(right), spotifyDurationMs);
+  gfx->setTextSize(1);
+  gfx->setTextColor(theme.muted);
+  gfx->setCursor(barX, 126);
+  gfx->print(left);
+  gfx->setCursor(barX + barW - (int)strlen(right) * 6, 126);
+  gfx->print(right);
+  drawPageDots();
+}
 // ── Captive-portal screen ─────────────────────────────────
 // Shown full-screen while AWM's portal is running, so the user can read
 // the AP name/password off the device itself.
@@ -1836,7 +2014,10 @@ void triggerFaceTap() {
   lastTapMs = now;
   // Single-tap behaviour
   if (currentApp == 0) {
-    faceMood = (faceMood+1) % FACE_MOOD_COUNT;
+    cancelShakeDizzy();
+    cycleFaceMood();
+    pressPulse = 1.0f;
+  } else if (currentApp == PAGE_SPOTIFY && spotifyHandleTap(touchLastX)) {
     pressPulse = 1.0f;
   } else {
     switchApp(1);
@@ -1857,13 +2038,15 @@ void readSensors() {
   filteredAx = filteredAx*0.88f + accel.accelX*0.12f;
   filteredAy = filteredAy*0.88f + accel.accelY*0.12f;
   filteredGz = filteredGz*0.82f + gyro.gyroZ*0.18f;
-  // Fast spin → surprised face
-  if (fabs(filteredGz) > 130.0f) { faceMood = 2; pressPulse = 1.0f; }
+  // Fast spin → timed dizzy, then back to the previous mood.
+  if (fabs(filteredGz) > 130.0f) enterDizzyFromShake();
 }
 
 void readTouch() {
   if (!touchReady) return;
-  //if (!touchWasDown && TOUCH_INT != 255 && digitalRead(TOUCH_INT) != LOW) return;
+  static uint32_t lastTouchPollMs = 0;
+  if (!touchWasDown && millis() - lastTouchPollMs < 25) return;
+  lastTouchPollMs = millis();
   uint16_t x = 0, y = 0;
   bsp_touch_read();
   if (bsp_touch_get_coordinates(&x, &y)) {
@@ -1896,7 +2079,11 @@ void readTouch() {
       touchMoved = false;
       touchPortalArmed = false;
     } else if (abs(dy) > 55 && abs(dy) > abs(dx)+18) {
-      setBrightness((int)brightnessLevel + (dy < 0 ? 24 : -24));
+      if (currentApp == PAGE_SPOTIFY) {
+        cycleSpotifyView(dy < 0 ? 1 : -1);
+      } else {
+        setBrightness((int)brightnessLevel + (dy < 0 ? 24 : -24));
+      }
       touchWasDown = false;
       touchMissFrames = 0;
       touchMoved = false;
@@ -1981,6 +2168,15 @@ void updateNetworkPages() {
     githubAttemptedAt = millis();
     fetchGithub();
   }
+
+  else if (currentApp == PAGE_SPOTIFY && spotifyConfigured()) {
+    bool cooled = spotifyBackoffUntil == 0 || (int32_t)(millis() - spotifyBackoffUntil) >= 0;
+    if (cooled && (spotifyAttemptedAt == 0 || millis() - spotifyAttemptedAt >= SPOTIFY_REFRESH_MS)) {
+      spotifyAttemptedAt = millis();
+      spotifyBackoffUntil = 0;
+      fetchSpotify();
+    }
+  }
 }
 
 void calibrateNeutral() {
@@ -2016,7 +2212,8 @@ void setup() {
   gfx->flush();
 
   Wire.begin(TOUCH_SDA, TOUCH_SCL);
-  Wire.setClock(100000);
+  Wire.setClock(400000);
+  Wire.setTimeOut(3);
   bsp_touch_init(&Wire, TOUCH_RST, TOUCH_INT, ROTATION, gfx->width(), gfx->height());
   touchReady = true;
   Serial.println("Touch controller initialised");
@@ -2029,9 +2226,7 @@ void setup() {
   if (!imuReady) Serial.println("IMU unavailable — using animated fallback motion");
 
   randomSeed(micros());
-  // Initialise the DESKBUDDY-style eyes, centred on the face page.
-  leftEye.init(FACE_LEFT_CX,  FACE_EYES_CY, 90, 90);
-  rightEye.init(FACE_RIGHT_CX, FACE_EYES_CY, 90, 90);
+  faceInit();
 
   // Build the enabled-page list from the SHOW_* toggles.
   buildPageList();
@@ -2073,7 +2268,7 @@ void setup() {
   // Keep reconnect attempts short so they don't stall the animation.
   wifiManager.setReconnectAttemptMs(WIFI_RETRY_WINDOW_MS);
   wifiManager.setReconnectBackoffMs(WIFI_RETRY_INTERVAL_MS);
-  wifiManager.setProtectedJsons({"/display.json"});
+  wifiManager.setProtectedJsons({"/display.json", "/spotify.json"});
 
   // Note: deliberately NOT calling setProtectedJsons({"/wifi.json"}).
   // Whitelisting wifi.json would make the portal's "erase credentials"
@@ -2081,6 +2276,7 @@ void setup() {
 
   wifiManager.begin();   // mounts LittleFS, loads stored credentials
   loadDisplaySettings();
+  loadSpotifyToken();
   ledcWrite(LCD_BL, brightnessLevel);
 
   // Verify the portal's HTML is actually on the filesystem. Without it AWM
@@ -2154,13 +2350,17 @@ void loop() {
     ty = cos(millis()*0.0011f)*0.16f;
   }
 
+  expireShakeDizzy();
+
   switch (currentApp) {
-    case 0: drawFace(tx, ty); break;
+    case 0: drawFace(tx, ty, wifiManager.isConnected(), wifiConfigured()); break;
     case 1: drawClock();      break;
     case 2: drawDatePage();   break;
     case 3: drawWeather();    break;
     case 4: drawMoon();       break;
     case 5: drawStock();      break;
+    case 6: drawGithub();     break;
+    case 7: drawSpotify();    break;
     default: drawGithub();    break;
   }
   // Brightness or auto-advance feedback banner — shown briefly after a gesture.

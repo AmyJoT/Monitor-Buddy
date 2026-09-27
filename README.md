@@ -22,6 +22,7 @@ It is also genuinely useful when you swipe past the face:
 - **Moon phase** with illumination percentage
 - **Stock ticker** for any US symbol, via a free Finnhub account
 - **GitHub stats** for your username
+- **Spotify now playing** (title, artist, progress) over Wi-Fi
 - **5 colour themes**, from plain white-on-black to a green-up / red-down semantic theme
 - **Toggle any page on or off** so your Buddy only shows what you care about
 - **Swipe** left and right to move between pages, up and down to adjust brightness,
@@ -149,6 +150,9 @@ Open `config/config.h` and change these `#define` lines:
 | `LAT` / `LONG`                 | your latitude and longitude for weather                                                                                       |
 | `TEMP` / `WIND`                | `"celsius"` or `"fahrenheit"`, `"kmh"` or `"mph"`                                                                             |
 | `SHOW_FACE`, `SHOW_CLOCK`, ... | `true` or `false` to enable or disable each page                                                                              |
+| `SPOTIFY_CLIENT_ID`            | Spotify app client ID. Leave blank to hide now-playing until you set it up (see [4.11](#411-spotify-now-playing))            |
+| `SPOTIFY_REFRESH_TOKEN`        | refresh token printed by `scripts/spotify_auth.py`. No client secret is stored on the board                                 |
+| `SHOW_SPOTIFY`                 | `true` to add the now-playing page                                                                                            |
 
 Save the file (`Ctrl+S`).
 
@@ -207,10 +211,31 @@ To change the Wi-Fi later, **press and hold anywhere on the touchscreen for abou
 | No port shown / Upload can't find the board | Try a different USB-C cable. Many are charge-only. On Windows, check Device Manager for an unknown device and install the driver linked in [4.6](#46-plug-in-the-board). |
 | Upload starts then fails                    | Hold **BOOT**, click Upload, release BOOT when it connects.                                                                                                              |
 | Screen shows **PORTAL FILES MISSING**       | The automatic filesystem upload did not run (see [4.8](#48-portal-files-uploaded-automatically)). Run **Upload Filesystem Image** manually.                              |
+| Spotify page says **SET SPOTIFY**           | Paste the two `#define` lines from the auth script into `config/config.h`, set `SHOW_SPOTIFY true`, and upload again. A private session shows **NOTHING PLAYING**.      |
 | Setup page shows an error 500               | Same cause. Upload the filesystem image.                                                                                                                                 |
 | Clock or weather never updates              | Wi-Fi did not connect. Hold the screen for 3 seconds and redo the setup. Check `TZ_OFFSET_HOURS`.                                                                        |
 | Stock page is blank                         | Missing or wrong Finnhub key in `config/config.h`, or the symbol is not a US stock (the free Finnhub tier is US only).                                                   |
 | Build fails mentioning `ArduinoJson`        | Deprecation _warnings_ from `ArduinoJson` are expected and harmless. Only a red `error` is a real problem.                                                               |
+### 4.11 Spotify now playing
+
+The Spotify page shows the current track (title, artist, device, progress) with a dark colour theme derived from the current track. Long titles scroll slowly, and the page refreshes about every 15 seconds while it is visible. Swipe up or down on the Spotify page to switch between the detail view and a local spinning-vinyl view.
+
+1. In the [Spotify developer dashboard](https://developer.spotify.com/dashboard), create an app. Leave it in **development mode**. You do not need a client secret on the board.
+2. Add this redirect URI exactly: `http://127.0.0.1:8888/callback`
+3. On a computer that has Python 3, from the project folder:
+
+```
+python scripts/spotify_auth.py --client-id YOUR_CLIENT_ID
+```
+
+4. Sign in in the browser that opens. The script prints two `#define` lines. Paste them into `config/config.h` over the empty `SPOTIFY_CLIENT_ID` and `SPOTIFY_REFRESH_TOKEN` lines.
+5. Set `SHOW_SPOTIFY true`, save, and upload the firmware again.
+6. Swipe to the Spotify page while something is playing on that account. Private sessions and an idle player show **NOTHING PLAYING**.
+
+The page does not download album artwork. Track-specific colours are generated locally so artwork cannot stall the display or touch input.
+
+The refresh token is saved on the board if Spotify rotates it. Do not commit `config/config.h`.
+
 
 ---
 
