@@ -171,7 +171,7 @@ static constexpr uint8_t BRIGHTNESS_MINIMUM = 8;
 
 static constexpr uint32_t HTTP_TIMEOUT_MS              = 1500UL;
 static constexpr uint32_t NTP_RETRY_INTERVAL_MS        = 60000UL;
-static constexpr uint32_t FETCH_RETRY_MS               = 60000UL;  // retry failed weather/GitHub fetches
+static constexpr uint32_t FETCH_RETRY_MS               = 60000UL;
 static constexpr uint32_t WEATHER_REFRESH_INTERVAL_MS = 15UL * 60UL * 1000UL;
 static constexpr uint32_t GITHUB_REFRESH_INTERVAL_MS  = 30UL * 60UL * 1000UL;
 
@@ -940,7 +940,7 @@ void syncNTP() {
   if (ntpSynced) return;
   if (!wifiManager.isConnected()) return;
 
-  // Gate configTime() at 60 s; poll getLocalTime() every call (timeout 0).
+  // NTP answers later: check every loop, restart the request only every 60 s.
   bool startOrRetry = lastNtpAttemptMs == 0
                    || millis() - lastNtpAttemptMs >= NTP_RETRY_INTERVAL_MS;
   if (startOrRetry) {
