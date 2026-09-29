@@ -171,6 +171,7 @@ static constexpr uint8_t BRIGHTNESS_MINIMUM = 8;
 
 static constexpr uint32_t HTTP_TIMEOUT_MS              = 1500UL;
 static constexpr uint32_t NTP_RETRY_INTERVAL_MS        = 60000UL;
+static constexpr uint32_t FETCH_RETRY_MS               = 60000UL;  // retry failed weather/GitHub fetches
 static constexpr uint32_t WEATHER_REFRESH_INTERVAL_MS = 15UL * 60UL * 1000UL;
 static constexpr uint32_t GITHUB_REFRESH_INTERVAL_MS  = 30UL * 60UL * 1000UL;
 
@@ -938,18 +939,20 @@ void openSetupPortal(const char *reason) {
 void syncNTP() {
   if (ntpSynced) return;
   if (!wifiManager.isConnected()) return;
-  if (lastNtpAttemptMs != 0 && millis() - lastNtpAttemptMs < NTP_RETRY_INTERVAL_MS) return;
-  lastNtpAttemptMs = millis();
 
-  // Numeric offset: TZ_OFFSET_HOURS * 3600 seconds. DST = 0.
-  configTime((long)TZ_OFFSET_HOURS * 3600L, 0, "pool.ntp.org", "time.cloudflare.com");
+  // Gate configTime() at 60 s; poll getLocalTime() every call (timeout 0).
+  bool startOrRetry = lastNtpAttemptMs == 0
+                   || millis() - lastNtpAttemptMs >= NTP_RETRY_INTERVAL_MS;
+  if (startOrRetry) {
+    lastNtpAttemptMs = millis();
+    // Numeric offset: TZ_OFFSET_HOURS * 3600 seconds. DST = 0.
+    configTime((long)TZ_OFFSET_HOURS * 3600L, 0, "pool.ntp.org", "time.cloudflare.com");
+  }
 
-  // Check once without waiting. The system SNTP task will populate the time
-  // asynchronously; the UI loop must remain responsive while it does so.
   struct tm ti;
   memset(&ti, 0, sizeof(ti));
   if (!getLocalTime(&ti, 0) || ti.tm_year <= 100) {
-    Serial.println("NTP: pending — using compile-time seed");
+    if (startOrRetry) Serial.println("NTP: pending — using compile-time seed");
     return;
   }
 
@@ -1951,10 +1954,10 @@ void updateNetworkPages() {
   // Nothing to fetch without a live STA connection.
   if (!ensureWifi()) return;
 
-  // Weather: refresh every 15 min while on the weather page.
-  if (currentApp == PAGE_WEATHER
-      && (!weatherValid || millis() - weatherUpdatedAt > WEATHER_REFRESH_INTERVAL_MS)
-      && (weatherAttemptedAt == 0 || millis() - weatherAttemptedAt > WEATHER_REFRESH_INTERVAL_MS)) {
+  // Weather: full interval after a success; retry failed fetches after FETCH_RETRY_MS.
+  bool weatherDue = !weatherValid || millis() - weatherUpdatedAt >= WEATHER_REFRESH_INTERVAL_MS;
+  bool weatherRetryOk = weatherAttemptedAt == 0 || millis() - weatherAttemptedAt >= FETCH_RETRY_MS;
+  if (currentApp == PAGE_WEATHER && weatherDue && weatherRetryOk) {
     weatherAttemptedAt = millis();
     fetchWeather();
   }
@@ -1974,12 +1977,14 @@ void updateNetworkPages() {
     }
   }
 
-  // GitHub: refresh every 30 min while on the GitHub page.
-  else if (currentApp == PAGE_GITHUB
-           && (!githubValid || millis() - githubUpdatedAt > GITHUB_REFRESH_INTERVAL_MS)
-           && (githubAttemptedAt == 0 || millis() - githubAttemptedAt > GITHUB_REFRESH_INTERVAL_MS)) {
-    githubAttemptedAt = millis();
-    fetchGithub();
+  // GitHub: full interval after a success; retry failed fetches after FETCH_RETRY_MS.
+  else if (currentApp == PAGE_GITHUB) {
+    bool githubDue = !githubValid || millis() - githubUpdatedAt >= GITHUB_REFRESH_INTERVAL_MS;
+    bool githubRetryOk = githubAttemptedAt == 0 || millis() - githubAttemptedAt >= FETCH_RETRY_MS;
+    if (githubDue && githubRetryOk) {
+      githubAttemptedAt = millis();
+      fetchGithub();
+    }
   }
 }
 
@@ -2073,11 +2078,12 @@ void setup() {
   // Keep reconnect attempts short so they don't stall the animation.
   wifiManager.setReconnectAttemptMs(WIFI_RETRY_WINDOW_MS);
   wifiManager.setReconnectBackoffMs(WIFI_RETRY_INTERVAL_MS);
-  wifiManager.setProtectedJsons({"/display.json"});
 
-  // Note: deliberately NOT calling setProtectedJsons({"/wifi.json"}).
-  // Whitelisting wifi.json would make the portal's "erase credentials"
-  // button and the >=5 s button hold do nothing.
+  // Note: deliberately NOT calling setProtectedJsons().
+  // Protecting /wifi.json would make the portal's "erase credentials"
+  // button and the >=5 s button hold do nothing. Protecting
+  // /display.json would keep a near-black brightness across a factory
+  // reset, which is the case that reset is meant to recover.
 
   wifiManager.begin();   // mounts LittleFS, loads stored credentials
   loadDisplaySettings();
